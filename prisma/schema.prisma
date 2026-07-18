@@ -1,0 +1,288 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  APPROVER
+  VIEWER
+}
+
+enum DefinitionStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum VersionStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  WAITING_APPROVAL
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum StepType {
+  API_CALL
+  JOB
+  APPROVAL
+  CONDITION
+}
+
+enum StepRunStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  WAITING_APPROVAL
+  SUCCEEDED
+  FAILED
+  SKIPPED
+}
+
+enum TaskStatus {
+  AVAILABLE
+  LEASED
+  COMPLETED
+  FAILED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ApprovalDecisionType {
+  APPROVE
+  REJECT
+}
+
+enum ActorType {
+  SYSTEM
+  USER
+  WORKER
+}
+
+enum ExecutionEventType {
+  RUN_CREATED
+  RUN_STATUS_CHANGED
+  STEP_CREATED
+  STEP_STATUS_CHANGED
+  TASK_ENQUEUED
+  TASK_LEASED
+  TASK_RETRIED
+  APPROVAL_REQUESTED
+  APPROVAL_DECIDED
+  SYSTEM_NOTE
+}
+
+model User {
+  id                     String             @id @default(cuid())
+  email                  String             @unique
+  name                   String
+  passwordHash           String
+  role                   UserRole
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+  sessions               Session[]
+  createdWorkflowVersions WorkflowVersion[] @relation("CreatedWorkflowVersions")
+  startedWorkflowRuns    WorkflowRun[]      @relation("StartedWorkflowRuns")
+  approvalDecisions      ApprovalDecision[]
+  executionEvents        ExecutionEvent[]   @relation("ActorUserEvents")
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model WorkflowDefinition {
+  id                  String            @id @default(cuid())
+  key                 String            @unique
+  name                String
+  description         String?
+  status              DefinitionStatus  @default(ACTIVE)
+  latestVersionNumber Int               @default(1)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  versions            WorkflowVersion[]
+}
+
+model WorkflowVersion {
+  id                   String             @id @default(cuid())
+  workflowDefinitionId String
+  versionNumber        Int
+  status               VersionStatus      @default(DRAFT)
+  definition           Json
+  createdById          String
+  createdAt            DateTime           @default(now())
+  workflowDefinition   WorkflowDefinition @relation(fields: [workflowDefinitionId], references: [id], onDelete: Cascade)
+  createdBy            User               @relation("CreatedWorkflowVersions", fields: [createdById], references: [id])
+  runs                 WorkflowRun[]
+
+  @@unique([workflowDefinitionId, versionNumber])
+  @@index([workflowDefinitionId, status])
+}
+
+model WorkflowRun {
+  id              String           @id @default(cuid())
+  workflowVersionId String
+  startedById     String
+  displayName     String?
+  status          RunStatus        @default(PENDING)
+  input           Json
+  context         Json
+  output          Json?
+  currentStepKey  String?
+  idempotencyKey  String?          @unique
+  lastError       String?
+  startedAt       DateTime         @default(now())
+  completedAt     DateTime?
+  nextWakeAt      DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  workflowVersion WorkflowVersion  @relation(fields: [workflowVersionId], references: [id])
+  startedBy       User             @relation("StartedWorkflowRuns", fields: [startedById], references: [id])
+  steps           WorkflowStepRun[]
+  approvals       ApprovalRequest[]
+  events          ExecutionEvent[]
+
+  @@index([status, createdAt])
+  @@index([startedById, createdAt])
+}
+
+model WorkflowStepRun {
+  id                  String           @id @default(cuid())
+  workflowRunId       String
+  stepKey             String
+  stepName            String
+  stepType            StepType
+  status              StepRunStatus    @default(PENDING)
+  handlerKey          String?
+  conditionExpression String?
+  attemptCount        Int              @default(0)
+  maxAttempts         Int              @default(1)
+  backoffMs           Int              @default(0)
+  idempotencyKey      String           @unique
+  input               Json
+  output              Json?
+  metadata            Json?
+  lastError           String?
+  availableAt         DateTime?
+  leaseExpiresAt      DateTime?
+  workerId            String?
+  completedAt         DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  workflowRun         WorkflowRun      @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  task                WorkflowTask?
+  approval            ApprovalRequest?
+  idempotencyRecords  IdempotencyRecord[]
+  events              ExecutionEvent[]
+
+  @@unique([workflowRunId, stepKey])
+  @@index([workflowRunId, status])
+  @@index([status, availableAt])
+}
+
+model WorkflowTask {
+  id             String       @id @default(cuid())
+  stepRunId      String       @unique
+  queue          String
+  handlerKey     String
+  status         TaskStatus   @default(AVAILABLE)
+  availableAt    DateTime
+  leaseOwner     String?
+  leaseToken     String?
+  leaseExpiresAt DateTime?
+  attemptCount   Int          @default(0)
+  lastError      String?
+  payload        Json
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  stepRun        WorkflowStepRun @relation(fields: [stepRunId], references: [id], onDelete: Cascade)
+
+  @@index([status, availableAt])
+}
+
+model ApprovalRequest {
+  id             String         @id @default(cuid())
+  workflowRunId  String
+  stepRunId      String         @unique
+  requiredRole   UserRole
+  status         ApprovalStatus @default(PENDING)
+  requestedAt    DateTime       @default(now())
+  resolvedAt     DateTime?
+  resolutionNote String?
+  workflowRun    WorkflowRun    @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  stepRun        WorkflowStepRun @relation(fields: [stepRunId], references: [id], onDelete: Cascade)
+  decisions      ApprovalDecision[]
+
+  @@index([status, requestedAt])
+  @@index([workflowRunId, status])
+}
+
+model ApprovalDecision {
+  id                String               @id @default(cuid())
+  approvalRequestId String
+  actorUserId       String
+  decision          ApprovalDecisionType
+  comment           String?
+  createdAt         DateTime             @default(now())
+  approvalRequest   ApprovalRequest      @relation(fields: [approvalRequestId], references: [id], onDelete: Cascade)
+  actorUser         User                 @relation(fields: [actorUserId], references: [id])
+
+  @@index([approvalRequestId, createdAt])
+}
+
+model IdempotencyRecord {
+  id         String          @id @default(cuid())
+  key        String          @unique
+  stepRunId  String
+  actionType String
+  response   Json?
+  createdAt  DateTime        @default(now())
+  stepRun    WorkflowStepRun @relation(fields: [stepRunId], references: [id], onDelete: Cascade)
+
+  @@index([stepRunId, actionType])
+}
+
+model ExecutionEvent {
+  id          String             @id @default(cuid())
+  workflowRunId String
+  stepRunId   String?
+  actorType   ActorType
+  actorUserId String?
+  eventType   ExecutionEventType
+  fromStatus  String?
+  toStatus    String?
+  message     String
+  payload     Json?
+  createdAt   DateTime           @default(now())
+  workflowRun WorkflowRun        @relation(fields: [workflowRunId], references: [id], onDelete: Cascade)
+  stepRun     WorkflowStepRun?   @relation(fields: [stepRunId], references: [id], onDelete: Cascade)
+  actorUser   User?              @relation("ActorUserEvents", fields: [actorUserId], references: [id])
+
+  @@index([workflowRunId, createdAt])
+  @@index([stepRunId, createdAt])
+}

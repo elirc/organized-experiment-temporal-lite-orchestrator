@@ -1,0 +1,63 @@
+export const starterWorkflowDefinition = {
+  initialStepKey: "fetch-account",
+  steps: [
+    {
+      key: "fetch-account",
+      name: "Fetch account profile",
+      type: "API_CALL",
+      handlerKey: "fetch-account-profile",
+      queue: "default",
+      retry: { maxAttempts: 3, initialDelayMs: 10000 },
+      next: { onSuccess: "route-score" },
+    },
+    {
+      key: "route-score",
+      name: "Route by risk score",
+      type: "CONDITION",
+      condition: {
+        source: "context",
+        path: "riskScore",
+        operator: "gte",
+        value: 70,
+      },
+      branches: [
+        { match: true, nextStepKey: "manager-approval" },
+        { match: false, nextStepKey: "generate-summary" },
+      ],
+    },
+    {
+      key: "manager-approval",
+      name: "Manager approval",
+      type: "APPROVAL",
+      approvalRole: "APPROVER",
+      next: { onApprove: "generate-summary", onReject: "notify-rejected" },
+    },
+    {
+      key: "generate-summary",
+      name: "Generate summary packet",
+      type: "JOB",
+      handlerKey: "generate-summary-packet",
+      queue: "default",
+      retry: { maxAttempts: 4, initialDelayMs: 30000 },
+      next: { onSuccess: "notify-finished" },
+    },
+    {
+      key: "notify-rejected",
+      name: "Notify request rejected",
+      type: "API_CALL",
+      handlerKey: "notify-rejected-webhook",
+      queue: "default",
+      retry: { maxAttempts: 2, initialDelayMs: 60000 },
+      next: { onSuccess: null },
+    },
+    {
+      key: "notify-finished",
+      name: "Notify finished",
+      type: "API_CALL",
+      handlerKey: "notify-finished-webhook",
+      queue: "default",
+      retry: { maxAttempts: 2, initialDelayMs: 60000 },
+      next: { onSuccess: null },
+    },
+  ],
+};
