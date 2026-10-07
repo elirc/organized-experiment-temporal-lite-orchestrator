@@ -61,3 +61,62 @@
 5. `src/lib/workflows/definition-schema.ts` — `workflowDefinitionSchema.superRefine()` detects a missing target step or duplicate key and throws.
 6. `src/lib/api/route-helpers.ts` — `jsonError()` returns a non-2xx response.
 7. `src/services/workflow-definition-service.ts` and `src/repositories/workflow-definition-repository.ts` are never called.
+
+## Flow: Handler fails and is retried (with line numbers)
+
+The demo launcher input asks `notify-finished-webhook` to fail once (`src/components/runs/run-launcher.tsx:17-19`). This is the path that failure takes.
+
+1. `src/worker/handlers/index.ts:84-86` — `notifyWebhook()` sees `shouldFailOnce(task)` is true (task `attemptCount === 0`) and throws `Simulated first-attempt failure for notify-finished-webhook.`
+2. `src/services/worker-service.ts:113-120` — the `catch` turns the error into a message and calls `failTaskStep()`.
+3. `src/services/workflow-engine-service.ts:513-524` — inside a transaction, reloads the run aggregate and finds the step.
+4. `workflow-engine-service.ts:526-536` — step `RUNNING → FAILED`, `lastError` stored, `STEP_STATUS_CHANGED` event appended.
+5. `workflow-engine-service.ts:538` — `attemptCount` is 1 and `maxAttempts` is 2 (`src/lib/workflows/starter-definition.ts:59`), so retry.
+6. `workflow-engine-service.ts:552-554` — `nextAttemptAt = now + calculateRetryDelayMs(60000, 1)`, which is 65 000 ms (60 000 plus jitter capped at 5 000).
+7. `workflow-engine-service.ts:557-564` — the **same** task row goes back to `AVAILABLE` with `availableAt = nextAttemptAt`; lease fields cleared.
+8. `workflow-engine-service.ts:566-573` — step `FAILED → QUEUED`.
+9. `workflow-engine-service.ts:575-591` — run gets `lastError` and `nextWakeAt`; `TASK_RETRIED` event appended.
+10. About 65 s later, `claimNextAvailableTask()` (`src/repositories/task-repository.ts:60`) sees `availableAt <= NOW()` and leases the task again. `shouldFailOnce` is now false (task `attemptCount` is 1), so the webhook "succeeds" and `completeTaskStep()` finishes the run.
+
+What the run detail page shows during the wait: run status stays `RUNNING` (the run is never moved to a "retrying" state), step status `QUEUED`, `lastError` populated.
+
+## Flow: Handler key has no registered handler (the infinite loop)
+
+1. A workflow version is saved with `handlerKey: "send-invoice"`. `definition-schema.ts:45` only requires a non-empty string; nothing checks it against `taskHandlers` (`src/worker/handlers/index.ts:109-114`).
+2. A run reaches that step; `createTaskStep()` enqueues it (`workflow-engine-service.ts:166-221`).
+3. `processNextTask()` claims it, finds no handler (`worker-service.ts:82-84`) and calls `failTaskStep()` straight away, skipping `markTaskExecutionStarted()`.
+4. Step `QUEUED → FAILED` (legal: `run-state-machine.ts:24`). `attemptCount` is still 0, so `0 < maxAttempts`: retry.
+5. `calculateRetryDelayMs(backoff, 0)` uses `Math.max(0, attemptNumber - 1)`, so the delay is the same as attempt 1 and never grows.
+6. Steps 3-5 repeat indefinitely, appending three events per pass (two `STEP_STATUS_CHANGED`, one `TASK_RETRIED`).
+
+A scratch model of the guard at `:538` scheduled 50 retries in 50 iterations with no stopping condition (see the testing doc).
+
+## Flow: Worker process killed mid-task (no recovery)
+
+1. Worker A claims task T: T is `LEASED`, `leaseOwner = A`, `leaseExpiresAt = now + 30 s` (`task-repository.ts:66-69`; default lease `30_000` at `worker-service.ts:70`).
+2. A calls `markTaskExecutionStarted()`: step `RUNNING`.
+3. A is killed (deploy, OOM, Ctrl-C twice) before `completeTaskStep()`.
+4. Worker B polls. Its claim selects only `status = 'AVAILABLE'` (`task-repository.ts:59`). T is never selected again.
+5. The run detail page shows the run `RUNNING` and the step `RUNNING` with `workerId = A`, indefinitely.
+
+Note that SIGINT/SIGTERM are handled gracefully: they set `shouldContinue = false` (`src/worker/index.ts:47-53`), and the loop finishes the current iteration before exiting. Only a hard kill or a crash produces this flow.
+
+## Debugging scenarios
+
+Each starts from a symptom an operator would actually see and ends at a line of code.
+
+**Scenario A: "My run has been RUNNING for an hour and nothing is happening."**
+1. Open run detail. Look at the last step's status and the last event.
+2. Step `QUEUED`, last event `TASK_ENQUEUED` or `TASK_RETRIED`: check that a worker process is running at all (`npm run worker`). The web app never executes tasks.
+3. Step `QUEUED`, `availableAt` in the future: it is waiting out backoff. Compute the expected delay with `calculateRetryDelayMs`.
+4. Step `RUNNING`, `workerId` set, no recent events: the worker that leased it died (flow above). The fix today is manual SQL: set the task back to `AVAILABLE` and the step back to `QUEUED`. Note that `QUEUED` is not reachable from `RUNNING` in the transition table (`run-state-machine.ts:25`), so the application cannot do this repair for you.
+5. Many `TASK_RETRIED` events with `attemptCount` stuck at 0: unregistered handler key (infinite-loop flow above).
+
+**Scenario B: "Approver says the approval isn't in their queue."**
+1. Check the approval's `requiredRole`. `listPendingApprovals()` shows non-admins only rows matching their role (`src/repositories/approval-repository.ts:17-20`).
+2. Check the run actually reached the approval step: with the starter workflow, only runs whose `riskScore >= 70` go there (`starter-definition.ts:16-26`).
+
+**Scenario C: "Starting a run with a typo in the JSON gives 'Internal server error'."**
+That is finding F5: a `ZodError` from `startWorkflowRunSchema.parse()` reaches `jsonError()`'s generic branch (`src/lib/api/route-helpers.ts:55-60`). The server log will show the Zod issues via `console.error(error)` at `:55`; the client will not.
+
+**Scenario D: "The worker exited with code 1."**
+Any exception outside the handler `try` (database unreachable during the claim, `markTaskExecutionStarted()` throwing) reaches `main().catch` and calls `process.exit(1)` (`src/worker/index.ts:55-58`). Restart it under a supervisor; the loop has no internal retry.
